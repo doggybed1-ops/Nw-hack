@@ -1,11 +1,59 @@
+-- Executor capability checks and bounded module discovery.
+local VGCompat={modules=setmetatable({},{__mode="k"}),pending=0,limit=8,timeout=.25}
+do
+    local missing={}
+    for name,available in pairs({
+        getloadedmodules=type(getloadedmodules)=="function",
+        ["debug.getupvalues"]=type(debug)=="table" and type(debug.getupvalues)=="function",
+        ["debug.setupvalue"]=type(debug)=="table" and type(debug.setupvalue)=="function",
+        ["debug.info"]=type(debug)=="table" and type(debug.info)=="function"
+    }) do
+        if not available then table.insert(missing,name) end
+    end
+    table.sort(missing)
+    assert(#missing==0,"VG Client: executor is missing required functions: "..table.concat(missing,", "))
+end
+function VGCompat.loadedModules()
+    local ok,result=pcall(getloadedmodules)
+    assert(ok and type(result)=="table","VG Client: getloadedmodules failed: "..tostring(result))
+    return result
+end
+function VGCompat.requireModule(module)
+    if typeof(module)~="Instance" or not module:IsA("ModuleScript") then
+        return false,"Not a ModuleScript"
+    end
+    local entry=VGCompat.modules[module]
+    if not entry then
+        if VGCompat.pending>=VGCompat.limit then return false,"Module discovery is busy" end
+        entry={done=false};VGCompat.modules[module]=entry;VGCompat.pending+=1
+        -- pcall alone does not protect the caller from an indefinitely yielding require.
+        task.spawn(function()
+            local ok,value=pcall(require,module)
+            entry.ok=ok;entry.value=value;entry.done=true
+            VGCompat.pending-=1
+        end)
+    end
+    if not entry.done and not entry.timedOut then
+        local deadline=os.clock()+VGCompat.timeout
+        repeat task.wait() until entry.done or os.clock()>=deadline
+        if not entry.done then
+            entry.timedOut=true
+            warn("VG Client: module is still loading; continuing startup: "..module:GetFullName())
+        end
+    end
+    -- Keep the pending result so later scans can discover a module that eventually loads.
+    -- Do not cancel its coroutine or start duplicate requires.
+    if not entry.done then return false,"Module is still loading" end
+    return entry.ok,entry.value
+end
 -- VG Client | Napoleonic Wars places; no place-ID restriction.
 -- Tracers show sampled client paths, not confirmed server impacts.
--- Create the asset folder relative to Potassium's executor workspace.
+-- Create the asset folder relative to the executor workspace.
 -- Existing files are preserved. The script itself stays outside this folder.
 local VG_ASSET_FOLDER = "VG Client"
 local folderReady, folderError = pcall(function()
     assert(type(isfolder) == "function" and type(makefolder) == "function",
-        "Potassium filesystem functions are unavailable")
+        "Executor filesystem functions are unavailable")
     if not isfolder(VG_ASSET_FOLDER) then
         makefolder(VG_ASSET_FOLDER)
     end
@@ -20,9 +68,9 @@ if game.GameId==4260784961 then
  local deadline=os.clock()+30
  repeat
   local ready={};local rs=game:GetService("ReplicatedStorage")
-  for _,m in ipairs(getloadedmodules()) do
+  for _,m in ipairs(VGCompat.loadedModules()) do
    if not m:IsDescendantOf(game:GetService("CorePackages")) then
-    local ok,t=pcall(require,m)
+    local ok,t=VGCompat.requireModule(m)
     if ok and type(t)=="table" then
      if type(rawget(t,"fireBProjectile"))=="function" then ready.projectile=true end
      if type(rawget(t,"getLoadoutModel"))=="function" then ready.clothing=true end
@@ -212,9 +260,9 @@ end
 
 -- Discover by exported function and simulation name, not randomized paths.
 if type(getloadedmodules)=="function" and debug.getupvalues then
-    for _,m in ipairs(getloadedmodules()) do
+    for _,m in ipairs(VGCompat.loadedModules()) do
         if not m:IsDescendantOf(game:GetService("CorePackages")) then
-            local ok,t=pcall(require,m)
+            local ok,t=VGCompat.requireModule(m)
             if ok and type(t)=="table" and type(rawget(t,"getMisfired"))=="function" and type(rawget(t,"setRemainingRushTime"))=="function" and type(rawget(t,"morale"))=="number" then moraleClient=t end
             if ok and type(t)=="table" and type(rawget(t,"fireBProjectile"))=="function" then
                 for _,f in pairs(debug.getupvalues(t.fireBProjectile)) do
@@ -244,7 +292,7 @@ if storage then
     for _,name in ipairs({"GameInfo","GameRulesInfo"}) do
         local m=storage:FindFirstChild(name)
         if m then
-            local ok,t=pcall(require,m)
+            local ok,t=VGCompat.requireModule(m)
             if ok and type(t)=="table" then
                 for _,v in pairs(t) do
                     if type(v)=="table" then addSpread(v); addSpread(v.variables) end
@@ -498,9 +546,9 @@ local function wrapMethod(t,key,handler)
     t[key]=replacement
     table.insert(adapterRestores,function() if t[key]==replacement then t[key]=original end end)
 end
-for _,m in ipairs(getloadedmodules()) do
+for _,m in ipairs(VGCompat.loadedModules()) do
     if not m:IsDescendantOf(game:GetService("CorePackages")) then
-        local ok,t=pcall(require,m)
+        local ok,t=VGCompat.requireModule(m)
         if ok and type(t)=="table" then
             if type(rawget(t,"killed"))=="function" and type(rawget(t,"killedBy"))=="function" and type(rawget(t,"hitTargetKillfeed"))=="function" then killfeedClient=t end
             local okHorse,loss=pcall(function() return t.HorseStaminaLoss end)
@@ -932,9 +980,9 @@ function X.note(message)
     gui:SetAttribute("LastAction",tostring(message))
     if X.status then X.status.Text=tostring(message) end
 end
-for _,module in ipairs(getloadedmodules()) do
+for _,module in ipairs(VGCompat.loadedModules()) do
     if not module:IsDescendantOf(game:GetService("CorePackages")) then
-        local ok,t=pcall(require,module)
+        local ok,t=VGCompat.requireModule(module)
         if ok and type(t)=="table" then
             if rawget(t,"ClassName")=="TargetToolClient" then X.targetTool=t end
             if type(rawget(t,"loadouts"))=="table" then X.loadouts=t.loadouts end
@@ -1348,7 +1396,7 @@ table.insert(X.restores,X.cancelTargets)
 do
  local storage=game:GetService("ReplicatedStorage"):FindFirstChild("LoadoutsStorage")
  local module=storage and storage:FindFirstChild("LoadoutsTable")
- if module then local ok,t=pcall(require,module);if ok and type(t)=="table" then X.loadouts=t.loadouts or X.loadouts end end
+ if module then local ok,t=VGCompat.requireModule(module);if ok and type(t)=="table" then X.loadouts=t.loadouts or X.loadouts end end
 end
 -- Copy the native navigation graph, including order, icons, permissions and entry points.
 -- Preserve shared nodes and parent cycles without modifying the game's own table.
@@ -1383,7 +1431,7 @@ do
  local storage=game:GetService("ReplicatedStorage"):FindFirstChild("LoadoutsStorage")
  local module=storage and storage:FindFirstChild("NavigationTable")
  if module then
-  local ok,native=pcall(require,module)
+  local ok,native=VGCompat.requireModule(module)
   if ok and type(native)=="table" and type(native.navigationTable)=="table" then
    X.nativeUniformNavigation=X.copyUniformNavigation(native)
    X.unlockUniformNavigation(X.nativeUniformNavigation)
@@ -1703,7 +1751,7 @@ X.aimAnimationIds={}
 do
     local book=game.ReplicatedStorage:FindFirstChild("AssetBook")
     if book then
-        local ok,assets=pcall(require,book)
+        local ok,assets=VGCompat.requireModule(book)
         if ok and type(assets.GetAnimation)=="function" then
             local names={Aim=true,FlintlockPresent=true}
             if type(getgc)=="function" then for _,value in ipairs(getgc(true)) do
@@ -2312,7 +2360,7 @@ do
   local nations=game:GetService("ReplicatedStorage"):FindFirstChild("NationsInfo")
   local lookup=nations and nations:FindFirstChild("NationLookupTable")
   if lookup then
-   local ok,tableValue=pcall(require,lookup)
+   local ok,tableValue=VGCompat.requireModule(lookup)
    local nation=ok and tableValue[P:GetAttribute("NationTags")]
    if nation then entry=X.localUniformNavigation.entryPoints[nation.name] end
   end
